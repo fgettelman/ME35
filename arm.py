@@ -45,7 +45,7 @@ def tip(a1, a2):
  
 enc_shoulder = Count(32, 33)
 enc_elbow = Count(25, 26)      # must not share a pin with enc_shoulder
-s1 = PWM(Pin(5), freq=50)
+s1 = PWM(Pin(4), freq=50)
 s2 = PWM(Pin(19), freq=50)
  
 # start at the 0 point, wherever the encoders happen to be
