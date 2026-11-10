@@ -1,159 +1,159 @@
-# ROBOT - save on the robot ESP32 as main.py  (simple PD version)
-import time, json, gc, network, espnow
-from machine import Pin, I2C, PWM
-from neopixel import NeoPixel
- 
-# ---------------- settings ----------------
-SPEED = 0.14      # forward power 0..1 (raise a little if the wheels stop)
-KP = 0.09          # P: how hard to steer toward the line
-KD = 0.18          # D: stops wobbling
-LEFT_DIR = 1       # 1 or -1: flip if the LEFT wheel turns backwards
-RIGHT_DIR = -1     # 1 or -1: flip if the RIGHT wheel turns backwards
-CORNER_SPEED = 0.25  # wheel power when pivoting in a sharp corner
- 
-# ---------------- hardware ----------------
-center_bus = I2C(0, sda=Pin(21), scl=Pin(22))   # center colour sensor
-right_bus = I2C(1, sda=Pin(25), scl=Pin(33))    # right colour sensor
-np = NeoPixel(Pin(15), 2)
-button = Pin(0, Pin.IN, Pin.PULL_UP)            # BOOT button
-left_a, left_b = PWM(Pin(13), freq=1000, duty_u16=0), PWM(Pin(12), freq=1000, duty_u16=0)    # motor 1
-right_a, right_b = PWM(Pin(27), freq=1000, duty_u16=0), PWM(Pin(14), freq=1000, duty_u16=0)  # motor 2
- 
-def motor(a, b, speed):
-    duty = int(min(abs(speed), 1) * 65535)
-    a.duty_u16(duty if speed > 0 else 0)
-    b.duty_u16(duty if speed < 0 else 0)
- 
-def drive(left, right):
-    motor(left_a, left_b, LEFT_DIR * left)
-    motor(right_a, right_b, RIGHT_DIR * right)
- 
-def light(rgb):
-    np.fill(tuple(v // 4 for v in rgb)); np.write()
- 
-def wait_button():
-    while button.value(): time.sleep_ms(10)
-    while not button.value(): time.sleep_ms(10)
- 
-# ---------------- colour sensors (VEML6040) ----------------
-SENSORS = {"CENTER": center_bus, "RIGHT": right_bus}
-for bus in SENSORS.values():
-    bus.writeto_mem(0x10, 0x00, b"\x00\x00")    # 40 ms, auto mode, on
-time.sleep_ms(50)
- 
-def read(bus):                                  # [white, red, green, blue]
-    return [int.from_bytes(bus.readfrom_mem(0x10, r, 2), "little") for r in (0x0B, 0x08, 0x09, 0x0A)]
- 
-# ---------------- KNN colour training (saved in colors.json) ----------------
-FILE = "colors.json"
-COLORS = {"RED": (255, 0, 0), "GREEN": (0, 255, 0), "BLUE": (0, 0, 255)}
- 
-def train():
-    data = []
-    for label in ("WHITE", "BLACK", "RED", "GREEN", "BLUE"):
-        for s in SENSORS:
-            print("Put the", s, "sensor on", label, "and press BOOT")
-            wait_button()
-            for _ in range(40):
-                data.append([label, s] + read(SENSORS[s]))
-                time.sleep_ms(50)
-    with open(FILE, "w") as f:
-        json.dump(data, f)
-    return data
- 
-print("Press BOOT in the next 3 s to retrain")
-time.sleep(3)
+# Robot (listener / central): drives 2 motors from the joystick controller
+
+from BLE_CEEO import Listen
+from machine import Pin, PWM
+import time
+import json
+import color_knn
+import neopixel                                    # NEW
+
+sensor = color_knn.make_sensor()
+classifier = color_knn.ColorClassifier()
+
+NAME = "Tommy"         # must match the controller's NAME
+buffer = b""
+
+DEADZONE = 0.1         # ignore small wobble around the stick's center
+TIMEOUT_MS = 500       # stop the motors if no joystick data arrives for this long
+PWM_FREQ = 1000
+
+
+# ---------- Motors ----------
+def set_duty(pwm, frac):
+    # frac is 0 to 1; works on both old and new ESP32 MicroPython
+    if hasattr(pwm, "duty_u16"):
+        pwm.duty_u16(int(frac * 65535))
+    else:
+        pwm.duty(int(frac * 1023))
+
+
+def make_pwm(pin_num):
+    pwm = PWM(Pin(pin_num))
+    pwm.freq(PWM_FREQ)
+    set_duty(pwm, 0)
+    return pwm
+
+
+# Left motor: driver inputs IN1/IN2
+left_a = make_pwm(12)
+left_b = make_pwm(13)
+
+# Right motor: driver inputs IN3/IN4
+right_a = make_pwm(14)
+right_b = make_pwm(27)
+
+NUM_PIXELS = 8                                     # NEW: number of LEDs on your strip
+np = neopixel.NeoPixel(Pin(15), NUM_PIXELS)        # NEW
+
+latest = None          # newest (x, y) from the controller, or None if nothing new
+last_data = 0          # time of the last joystick message
+
+
+def clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
+
+def to_axis(n):
+    # Convert 0–1 into -1 to 1, with 0 at the center of the stick
+    v = (n - 0.5) * 2
+    if abs(v) < DEADZONE:
+        return 0.0
+    return v
+
+
+def set_motor(pin_a, pin_b, speed):
+    # speed is -1 (full reverse) to 1 (full forward)
+    if speed > 0:
+        set_duty(pin_a, speed)
+        set_duty(pin_b, 0)
+    elif speed < 0:
+        set_duty(pin_a, 0)
+        set_duty(pin_b, -speed)
+    else:
+        set_duty(pin_a, 0)
+        set_duty(pin_b, 0)
+
+
+def drive(x_norm, y_norm):
+    # Arcade mixing: y = forward/back, x = turn
+    forward = to_axis(y_norm)
+    turn = to_axis(x_norm)
+    left = clamp(forward + turn, -1.0, 1.0)
+    right = clamp(forward - turn, -1.0, 1.0)
+    set_motor(left_a, left_b, left)
+    set_motor(right_a, right_b, right)
+
+
+def stop_motors():
+    set_motor(left_a, left_b, 0)
+    set_motor(right_a, right_b, 0)
+
+
+def callback(data):
+    # Pieces arrive in up to 20-byte chunks; a newline ends each message
+    global buffer, latest, last_data
+    buffer += data
+    while b"\n" in buffer:
+        line, buffer = buffer.split(b"\n", 1)
+        try:
+            msg = json.loads(line.decode())
+        except ValueError:
+            continue           # skip a garbled message instead of crashing
+        if "x" in msg and "y" in msg:
+            latest = (msg["x"], msg["y"])
+            last_data = time.ticks_ms()
+            #print("Joystick:", latest)   # remove once everything works
+
+
+p = None
 try:
-    if button.value() == 0: raise OSError
-    data = json.load(open(FILE))
-except OSError:
-    data = train()
- 
-def avg(label, s):
-    v = [d[2] for d in data if d[0] == label and d[1] == s]
-    return sum(v) / len(v)
- 
-white = {s: avg("WHITE", s) for s in SENSORS}
-black = {s: avg("BLACK", s) for s in SENSORS}
- 
-def features(reading, s):
-    w, r, g, b = reading
-    t = (r + g + b) or 1
-    return (3 * r / t, 3 * g / t, 3 * b / t, w / white[s])
- 
-model = {s: [(d[0], features(d[2:], s)) for d in data if d[1] == s] for s in SENSORS}
-data = None
-gc.collect()
- 
-def classify(reading, s):                       # 5 nearest neighbours, 4 must agree
-    f = features(reading, s)
-    near = []
-    for lab, ft in model[s]:
-        d = sum((x - y) ** 2 for x, y in zip(f, ft))
-        if len(near) < 5:
-            near.append((d, lab))
-        elif d < max(near)[0]:
-            near.remove(max(near)); near.append((d, lab))
-    votes = [lab for _, lab in near]
-    best = max(set(votes), key=votes.count)
-    return best if votes.count(best) >= 4 else None
- 
-def brightness(reading, s):                     # 0 = black, 1 = white
-    return max(0, min(1, (reading[0] - black[s]) / (white[s] - black[s])))
- 
-# ---------------- station (ESP-NOW) ----------------
-network.WLAN(network.STA_IF).active(True)
-esp = espnow.ESPNow(); esp.active(True)
-STATION = b"\xff" * 6
-esp.add_peer(STATION)
- 
-def tell_station(color):                    # quick: never stops the robot for long
-    light(COLORS[color])                        # both LEDs show the colour
-    esp.send(STATION, color)
-    host, msg = esp.recv(50)                    # wait max 50 ms for the ACK
-    if msg == b"ACK " + color.encode():
-        print("Station ACK:", color)
-        np[1] = (60, 60, 60); np.write()        # LED 1 white = station acknowledged
-    else:
-        print("No ACK from station")
- 
-# ---------------- main loop ----------------
-print("Put the robot on the line and press BOOT")
-wait_button()
-last_error = 0
-seen, streak, last_stop = None, 0, 0
- 
-while True:
-    c = read(center_bus)
-    r = read(right_bus)
- 
-    # colour: same colour 3 readings in a row, at most once every 2 s
-    color = None
-    for s, reading in (("CENTER", c), ("RIGHT", r)):
-        lab = classify(reading, s)
-        if lab in COLORS:
-            color = lab
-    streak = streak + 1 if (color and color == seen) else (1 if color else 0)
-    seen = color
-    if streak >= 3 and time.ticks_diff(time.ticks_ms(), last_stop) > 2000:
-        print("Detected", color)
-        tell_station(color)                     # lights + station, robot keeps driving
-        last_stop = time.ticks_ms()
- 
-    # PD line following: tape runs between the sensors
-    bc = brightness(c, "CENTER")
-    br = brightness(r, "RIGHT")
-    if bc > 0.9 and br > 0.9:
-        # corner / line lost: pivot on the spot toward where the line was last seen
-        if last_error >= 0:
-            drive(CORNER_SPEED, -CORNER_SPEED)  # turn right
-        else:
-            drive(-CORNER_SPEED, CORNER_SPEED)  # turn left
-    else:
-        error = bc - br                         # + = line to the right, - = line to the left
-        turn = KP * error + KD * (error - last_error)
-        last_error = error
-        base = SPEED * (1 - 0.5 * abs(error))   # slow down while turning
-        drive(base + turn, base - turn)
-    gc.collect()
-    time.sleep_ms(20)
+    stop_motors()
+    p = Listen(NAME, verbose=False)
+    p.callback = callback
+
+    print("Looking for", NAME, "...")
+    if p.connect_up():
+        print("Connected")
+        b = PWM(Pin(4)); [(b.freq(f), time.sleep_ms(150)) for f in (1047, 1319, 1568, 2093)]; b.deinit()
+        last_data = time.ticks_ms()
+        on_red = False                             # NEW: True while over the red tape
+
+        while p.is_connected:
+            color = classifier.classify(sensor.rgbc())
+            if color == "red":
+    
+                if not on_red:                     # NEW: send once per crossing
+                    on_red = True                  # NEW
+                    payload = json.dumps("finish") + "\n"
+                    # NEW
+                    print(color)
+                    b = PWM(Pin(4)); [(b.freq(f), time.sleep_ms(150)) for f in (2093, 1568, 1319, 1047)]; b.deinit()
+                    for start in range(0, len(payload), 20):         # NEW
+                        p.send(payload[start:start + 20])            # NEW
+                        time.sleep_ms(20)                            # NEW
+                # NEW: blink red, switching on/off every 250 ms
+                if (time.ticks_ms() // 250) % 2 == 0:                # NEW
+                    np.fill((255, 0, 0))                             # NEW
+                else:                                                # NEW
+                    np.fill((0, 0, 0))                               # NEW
+                np.write()                                           # NEW
+            elif on_red:                           # NEW: left the tape
+                on_red = False                     # NEW
+                np.fill((0, 0, 0))                 # NEW: lights off
+                np.write()                         # NEW
+            # Drive the motors with the newest joystick reading
+            if latest is not None:
+                x_norm, y_norm = latest
+                latest = None
+                drive(x_norm, y_norm)
+
+            # Safety stop if the joystick data stops arriving
+            if time.ticks_diff(time.ticks_ms(), last_data) > TIMEOUT_MS:
+                stop_motors()
+
+            time.sleep_ms(10)
+    print("Lost connection")
+finally:
+    stop_motors()
+    if p:
+        p.disconnect()
